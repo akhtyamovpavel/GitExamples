@@ -224,7 +224,175 @@ M  = merge feature (применяет D, E)
 
 ---
 
-## 7. Внутреннее устройство: что происходит в `.git`
+## 7. Откатывание Merge-коммита через `git revert`
+
+Обычный коммит имеет **одного родителя**. Merge-коммит имеет **двух (или более) родителей**. Это создаёт проблему: при revert Git не знает, относительно какого родителя вычислять обратный diff.
+
+### Проблема: revert без `-m` не работает
+
+```bash
+git revert M
+# error: commit M is a merge but no -m option was given.
+# fatal: revert failed
+```
+
+Git требует указать, **какой родитель считать «основной линией» (mainline)**, чтобы понять, какие изменения отменять.
+
+### Что такое `-m` (mainline parent)
+
+У merge-коммита родители пронумерованы:
+
+```
+         parent 1         parent 2
+            │                 │
+            ▼                 ▼
+    A --- B --- C --- M    ← main (HEAD)
+                     /
+          D --- E ---      ← feature
+
+Коммит M имеет:
+  parent 1 = C  (ветка, В КОТОРУЮ мержили — main)
+  parent 2 = E  (ветка, КОТОРУЮ мержили — feature)
+```
+
+Посмотреть родителей можно так:
+
+```bash
+git cat-file -p <sha-of-M>
+# tree ...
+# parent <sha-of-C>    ← parent 1
+# parent <sha-of-E>    ← parent 2
+# author ...
+# committer ...
+# Merge branch 'feature' into main
+```
+
+### Флаг `-m 1` — отменить изменения из feature
+
+```bash
+git revert -m 1 M
+```
+
+Это значит: «Считай parent 1 (коммит C в main) основной линией. Отмени всё, что пришло из другой стороны (feature)».
+
+```
+До:
+    A --- B --- C --- M        ← main
+                     /
+          D --- E ---          ← feature
+
+git revert -m 1 M:
+    A --- B --- C --- M --- M'    ← main
+                     /
+          D --- E ---             ← feature
+
+M' отменяет все изменения, пришедшие из feature (коммиты D и E).
+Состояние кода в M' совпадает с состоянием в C.
+```
+
+### Флаг `-m 2` — отменить изменения из main
+
+```bash
+git revert -m 2 M
+```
+
+Это значит: «Считай parent 2 (коммит E в feature) основной линией. Отмени всё, что пришло из main».
+
+```
+git revert -m 2 M:
+    Состояние кода в M' совпадает с состоянием в E.
+    Отменяются изменения, которые были в main (коммит C), но не в feature.
+```
+
+⚠️ В подавляющем большинстве случаев нужен именно **`-m 1`** — вы отменяете влитую feature-ветку.
+
+### Полный пример: сломанный merge в production
+
+```bash
+# Ситуация: feature влили в main, и она сломала production
+git log --oneline --graph
+# *   abc1234 (HEAD -> main) Merge branch 'feature' into main
+# |\
+# | * def5678 (feature) Add new payment system
+# | * 111aaaa Refactor checkout
+# |/
+# * 222bbbb Last stable commit
+
+# Откатываем merge, сохраняя main как mainline
+git revert -m 1 abc1234
+# [main 333cccc] Revert "Merge branch 'feature' into main"
+
+# Пушим — никакого --force!
+git push origin main
+```
+
+### ⚠️ Подводный камень: повторный merge после revert merge
+
+После того как вы откатили merge через `revert -m 1`, Git считает, что коммиты из feature **уже были интегрированы**. Если вы попробуете снова влить ту же feature-ветку — **изменения не применятся**:
+
+```bash
+# feature починили и хотим влить снова
+git merge feature
+# Already up to date.  ← ИЛИ применятся только НОВЫЕ коммиты после E
+```
+
+```
+    A --- B --- C --- M --- M' --- ???
+                     /
+          D --- E --- F(fix)
+
+git merge feature:
+    Только F будет влит!
+    D и E Git считает уже обработанными (и отменёнными).
+```
+
+### Решение: revert the revert, затем merge
+
+```bash
+# 1. Отменяем revert-коммит (возвращаем изменения feature)
+git revert M'    # M'' — отмена отмены, изменения D+E возвращаются
+
+# 2. Теперь мержим feature с исправлениями
+git merge feature    # F применяется нормально
+
+# Итоговая история:
+#   A --- B --- C --- M --- M' --- M'' --- N    ← main
+#                    /                    /
+#         D --- E -------- F ------------       ← feature
+#
+# M   = merge feature (D+E вошли)
+# M'  = revert merge  (D+E отменены)
+# M'' = revert revert (D+E возвращены)
+# N   = merge feature (F входит)
+```
+
+### Альтернатива: rebase feature перед повторным merge
+
+Если не хотите «revert the revert», можно пересоздать коммиты feature с новыми SHA:
+
+```bash
+# Создаём новую ветку из feature и перебазируем
+git checkout feature
+git rebase --no-ff main
+# Теперь D и E получили новые SHA → Git считает их новыми коммитами
+
+git checkout main
+git merge feature    # Всё применяется нормально
+```
+
+### Сводная таблица: revert merge
+
+| Действие | Команда | Результат |
+|----------|---------|-----------|
+| Откатить влитую ветку | `git revert -m 1 <merge>` | Код как до merge, история сохранена |
+| Откатить основную линию | `git revert -m 2 <merge>` | Код как в feature-ветке (редко нужно) |
+| Повторно влить feature | `git revert <revert-commit>` + `git merge feature` | Полное восстановление |
+| Посмотреть родителей merge | `git cat-file -p <merge>` | Показывает parent 1, parent 2 |
+| Проверить номер parent | `git log --oneline --first-parent` | first-parent = parent 1 |
+
+---
+
+## 8. Внутреннее устройство: что происходит в `.git`
 
 ### При `git reset --hard HEAD~1`:
 
@@ -260,7 +428,7 @@ echo "<sha1 предыдущего коммита>" > .git/refs/heads/main
 
 ---
 
-## 8. Когда что использовать
+## 9. Когда что использовать
 
 ### Используйте `git reset` когда:
 
@@ -278,7 +446,7 @@ echo "<sha1 предыдущего коммита>" > .git/refs/heads/main
 
 ---
 
-## 9. Спасательный круг: `git reflog`
+## 10. Спасательный круг: `git reflog`
 
 Если вы случайно сделали `git reset --hard` и потеряли коммиты:
 
@@ -302,7 +470,7 @@ git branch recovery def5678
 
 ---
 
-## 10. Итоговая шпаргалка
+## 11. Итоговая шпаргалка
 
 ```
 ┌───────────────────────────────────────────────────────────┐
