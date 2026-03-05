@@ -108,25 +108,6 @@ git cat-file -p HEAD
 # Initial commit
 ```
 
-### 3.4. Tag (аннотированный)
-
-Хранит **информацию о теге**: ссылку на объект, тип, имя тега, автора и сообщение.
-
-```
-tag <размер>\0
-object <sha1 объекта>
-type commit
-tag v1.0.0
-tagger <Имя> <email> <timestamp> <timezone>
-
-<сообщение тега>
-```
-
-**Создание аннотированного тега:**
-```bash
-git tag -a v1.0.0 -m "Release version 1.0.0"
-```
-
 ---
 
 ## 4. Как вычисляется SHA-1
