@@ -1,0 +1,374 @@
+# Git Internals — Cheatsheet
+
+## 1. Архитектура Git
+
+Git — это **content-addressable filesystem**, то есть хранилище данных, адресуемое по содержимому. Каждый объект идентифицируется SHA-1 хешем своего содержимого.
+
+```
+Рабочая директория  →  Staging Area (Index)  →  Репозиторий (.git)
+     (Working Tree)        (git add)               (git commit)
+```
+
+---
+
+## 2. Директория `.git`
+
+При выполнении `git init` создаётся директория `.git` со следующей структурой:
+
+```
+.git/
+├── HEAD            # Указатель на текущую ветку
+├── config          # Локальная конфигурация репозитория
+├── description     # Описание (используется GitWeb)
+├── hooks/          # Скрипты-хуки (pre-commit, post-merge и т.д.)
+├── info/           # Дополнительная информация (exclude и др.)
+├── objects/        # Хранилище всех объектов (blob, tree, commit, tag)
+│   ├── pack/       # Упакованные объекты (packfiles)
+│   └── info/       # Информация о pack-файлах
+├── refs/           # Ссылки (branches, tags)
+│   ├── heads/      # Локальные ветки
+│   └── tags/       # Теги
+└── index           # Staging area (бинарный файл)
+```
+
+---
+
+## 3. Объекты Git
+
+В Git существует **4 типа объектов**. Все хранятся в `.git/objects/` в сжатом виде (zlib).
+
+### 3.1. Blob (Binary Large Object)
+
+Хранит **содержимое файла** (без имени и метаданных).
+
+```
+blob <размер>\0<содержимое файла>
+```
+
+**Создание blob вручную:**
+```bash
+echo -n "Hello, Git!" | git hash-object -w --stdin
+# Вернёт SHA-1 хеш, например: a1b2c3d4...
+```
+
+**Просмотр содержимого blob:**
+```bash
+git cat-file -p <sha1>    # Вывести содержимое
+git cat-file -t <sha1>    # Вывести тип объекта
+git cat-file -s <sha1>    # Вывести размер объекта
+```
+
+### 3.2. Tree
+
+Хранит **структуру директории**: список файлов и поддиректорий с правами доступа.
+
+```
+tree <размер>\0
+<режим> <имя>\0<20-байт SHA-1>
+<режим> <имя>\0<20-байт SHA-1>
+...
+```
+
+| Режим    | Описание                     |
+|----------|------------------------------|
+| `100644` | Обычный файл                 |
+| `100755` | Исполняемый файл             |
+| `120000` | Символическая ссылка         |
+| `040000` | Поддиректория (tree)         |
+
+**Просмотр tree:**
+```bash
+git cat-file -p main^{tree}
+# 100644 blob a1b2c3...    README.md
+# 040000 tree d4e5f6...    src
+```
+
+### 3.3. Commit
+
+Хранит **метаданные коммита**: ссылку на tree, родителя, автора, коммиттера, сообщение.
+
+```
+commit <размер>\0
+tree <sha1 дерева>
+parent <sha1 родительского коммита>    ← может быть 0 (initial), 1 или несколько (merge)
+author <Имя> <email> <timestamp> <timezone>
+committer <Имя> <email> <timestamp> <timezone>
+
+<сообщение коммита>
+```
+
+**Просмотр коммита:**
+```bash
+git cat-file -p HEAD
+# tree 4a5b6c...
+# parent 1d2e3f...
+# author Pavel <pavel@example.com> 1709654400 +0300
+# committer Pavel <pavel@example.com> 1709654400 +0300
+#
+# Initial commit
+```
+
+### 3.4. Tag (аннотированный)
+
+Хранит **информацию о теге**: ссылку на объект, тип, имя тега, автора и сообщение.
+
+```
+tag <размер>\0
+object <sha1 объекта>
+type commit
+tag v1.0.0
+tagger <Имя> <email> <timestamp> <timezone>
+
+<сообщение тега>
+```
+
+**Создание аннотированного тега:**
+```bash
+git tag -a v1.0.0 -m "Release version 1.0.0"
+```
+
+---
+
+## 4. Как вычисляется SHA-1
+
+Git вычисляет хеш по формуле:
+
+```
+SHA-1("<тип> <размер>\0<содержимое>")
+```
+
+**Пример для blob:**
+```bash
+# Способ 1: через git
+echo -n "Hello" | git hash-object --stdin
+# ce013625030ba8dba906f756967f9e9ca394464a
+
+# Способ 2: вручную (проверка)
+printf "blob 5\0Hello" | sha1sum
+# ce013625030ba8dba906f756967f9e9ca394464a
+```
+
+---
+
+## 5. Хранение объектов
+
+Объект с хешем `ce013625030ba8dba906f756967f9e9ca394464a` хранится по пути:
+
+```
+.git/objects/ce/013625030ba8dba906f756967f9e9ca394464a
+```
+
+Первые **2 символа** — имя директории, остальные **38** — имя файла. Содержимое сжато с помощью **zlib**.
+
+**Чтение raw-объекта (Python):**
+```python
+import zlib, hashlib
+
+with open(".git/objects/ce/013625030ba8dba906f756967f9e9ca394464a", "rb") as f:
+    raw = zlib.decompress(f.read())
+    print(raw)
+    # b'blob 5\x00Hello'
+```
+
+---
+
+## 6. HEAD и ссылки (refs)
+
+### HEAD
+
+`HEAD` — указатель на текущую позицию в истории.
+
+```bash
+cat .git/HEAD
+# ref: refs/heads/main        ← символическая ссылка (обычное состояние)
+# a1b2c3d4e5f6...             ← прямой SHA-1 (detached HEAD)
+```
+
+### Ветки (branches)
+
+Ветка — это просто **файл с SHA-1 хешем коммита**.
+
+```bash
+cat .git/refs/heads/main
+# a1b2c3d4e5f6789...
+```
+
+### Символические ссылки
+
+```bash
+git symbolic-ref HEAD                    # Узнать текущую ветку
+git symbolic-ref HEAD refs/heads/dev     # Переключить HEAD на dev
+```
+
+---
+
+## 7. Index (Staging Area)
+
+Index — бинарный файл `.git/index`, который хранит снимок подготовленных к коммиту файлов.
+
+**Полезные команды:**
+```bash
+git ls-files --stage          # Показать содержимое индекса
+git update-index --add <file> # Добавить файл в индекс вручную
+git read-tree <tree-sha1>     # Загрузить tree в индекс
+git write-tree                # Записать индекс как tree-объект
+```
+
+---
+
+## 8. Packfiles
+
+Для экономии места Git периодически упаковывает loose-объекты в **packfiles**.
+
+```
+.git/objects/pack/
+├── pack-<hash>.pack    # Упакованные объекты (дельта-сжатие)
+└── pack-<hash>.idx     # Индекс для быстрого поиска
+```
+
+**Полезные команды:**
+```bash
+git gc                          # Запустить сборку мусора и упаковку
+git verify-pack -v <pack>.idx   # Просмотреть содержимое pack-файла
+git count-objects -v            # Статистика объектов
+git unpack-objects < <pack>.pack  # Распаковать pack-файл
+```
+
+---
+
+## 9. Низкоуровневые (plumbing) команды
+
+| Команда | Описание |
+|---------|----------|
+| `git hash-object` | Вычислить хеш и (опционально) записать объект |
+| `git cat-file` | Прочитать содержимое/тип/размер объекта |
+| `git ls-tree` | Показать содержимое tree-объекта |
+| `git ls-files` | Показать файлы в индексе |
+| `git write-tree` | Записать индекс как tree-объект |
+| `git read-tree` | Прочитать tree в индекс |
+| `git commit-tree` | Создать commit-объект из tree |
+| `git update-ref` | Обновить ссылку (ref) |
+| `git symbolic-ref` | Управление символическими ссылками |
+| `git rev-parse` | Преобразовать имя в SHA-1 |
+| `git for-each-ref` | Перебрать все ссылки |
+| `git reflog` | Показать журнал изменений ссылок |
+
+---
+
+## 10. Создание коммита вручную (plumbing)
+
+Пошаговое создание коммита без `git add` и `git commit`:
+
+```bash
+# 1. Создаём blob
+echo "Hello, World!" | git hash-object -w --stdin
+# → abc123...
+
+# 2. Добавляем blob в индекс
+git update-index --add --cacheinfo 100644,abc123...,hello.txt
+
+# 3. Создаём tree из индекса
+git write-tree
+# → def456...
+
+# 4. Создаём commit из tree
+echo "My first plumbing commit" | git commit-tree def456...
+# → 789abc...
+
+# 5. Обновляем ветку main
+git update-ref refs/heads/main 789abc...
+```
+
+---
+
+## 11. Модель данных: граф объектов
+
+```
+                    refs/heads/main
+                          │
+                          ▼
+    ┌──────────────────────────┐
+    │       COMMIT (C2)        │
+    │  tree: T2                │
+    │  parent: C1              │
+    │  author: Pavel           │
+    │  message: "Add feature"  │
+    └──────────┬───────────────┘
+               │ parent
+               ▼
+    ┌──────────────────────────┐
+    │       COMMIT (C1)        │
+    │  tree: T1                │
+    │  parent: (none)          │
+    │  author: Pavel           │
+    │  message: "Initial"      │
+    └──────────┬───────────────┘
+               │ tree
+               ▼
+    ┌──────────────────────────┐
+    │        TREE (T1)         │
+    │  100644 blob B1 README.md│
+    │  040000 tree T3 src/     │
+    └───┬──────────────┬───────┘
+        │              │
+        ▼              ▼
+    ┌────────┐   ┌──────────┐
+    │BLOB(B1)│   │ TREE(T3) │
+    │"# Hi"  │   │ main.py  │
+    └────────┘   └────┬─────┘
+                      │
+                      ▼
+                 ┌─────────┐
+                 │ BLOB(B2)│
+                 │print()  │
+                 └─────────┘
+```
+
+---
+
+## 12. Полезные команды для исследования
+
+```bash
+# Посмотреть тип любого объекта
+git cat-file -t <sha1>
+
+# Посмотреть содержимое любого объекта
+git cat-file -p <sha1>
+
+# Найти все объекты в репозитории
+find .git/objects -type f | head -20
+
+# Посмотреть цепочку коммитов
+git log --oneline --graph --all
+
+# Показать tree текущего коммита
+git ls-tree -r HEAD
+
+# Показать все ссылки
+git for-each-ref --format='%(refname) → %(objectname:short)'
+
+# Проверить целостность репозитория
+git fsck --full
+
+# Посмотреть reflog
+git reflog show HEAD
+```
+
+---
+
+## 13. Шпаргалка по сокращениям
+
+| Сокращение | Полная форма | Описание |
+|------------|-------------|----------|
+| `HEAD` | — | Текущий коммит |
+| `HEAD~1` | `HEAD~` | Родитель текущего коммита |
+| `HEAD~2` | — | Прародитель (2 уровня назад) |
+| `HEAD^1` | `HEAD^` | Первый родитель (при merge) |
+| `HEAD^2` | — | Второй родитель (при merge) |
+| `main^{tree}` | — | Tree-объект коммита main |
+| `HEAD:file.txt` | — | Blob файла в текущем коммите |
+| `@{-1}` | — | Предыдущая ветка |
+
+---
+
+> **Совет:** Чтобы по-настоящему понять Git, попробуйте создать коммит используя только plumbing-команды (раздел 10). Это лучший способ разобраться в том, как Git работает «под капотом»! 🔧
